@@ -4,7 +4,7 @@ SPICE selection 0 remains the normal clipboard; selection 1 is PRIMARY (Unix mid
 
 The implementation follows upstream C spice-vdagent commit f25c7927cae05ae9cf9838a70bb20b2fb09e6122: separate source, offer, ownership and pending paste state for each selection; source identity determines the selection; MIME lists belong to offer objects; host grabs advertise MIME types but request data only on paste. Data replies run through the main event loop so concurrent selections and interleaved messages remain intact. Pending requests close after three seconds without a reply; reading a reply retains the prior three-second per-read idle deadline.
 
-Build with `cargo build --locked --release`. Run `tests/run-headless.sh` with labwc, wl-copy, wl-paste and Python 3 installed. The tests start an isolated headless compositor and simulated spice-vdagentd; no desktop clipboard, system agent or service is changed.
+Build with `cargo build --locked --release`. Run `sh tests/run-headless.sh` with labwc, wl-copy, wl-paste and Python 3 installed. The tests start an isolated headless compositor and simulated spice-vdagentd; no desktop clipboard, system agent or service is changed.
 
 For diagnostics, `WAYLAND_VDAGENT_DATA_CONTROL=wlr` forces the legacy protocol; the default prefers ext when available. `WAYLAND_VDAGENT_SOCKET` overrides the daemon socket for isolated tests; normally leave it unset.
 
