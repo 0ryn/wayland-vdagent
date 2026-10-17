@@ -11,30 +11,24 @@ mod udscs;
 
 use data_control::*;
 use std::io::{Read, Write};
-use std::os::unix::io::{AsFd, AsRawFd, FromRawFd, IntoRawFd};
+use std::os::unix::io::{AsFd, AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use udscs::*;
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry;
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::{
-    delegate_noop, event_created_child, Connection, Dispatch, EventQueue, QueueHandle, WEnum,
+    delegate_noop, event_created_child, Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
 };
 
 const VDAGENTD_SOCKET: &str = "/run/spice-vdagentd/spice-vdagent-sock";
 
-/// Maximum idle time while waiting for a clipboard payload from spice-vdagentd.
-/// Matches the Windows agent's `VD_CLIPBOARD_TIMEOUT_MS`. Applied via
-/// `set_read_timeout`, which is a *per-read* deadline — so the overall wait for
-/// a multi-chunk payload (e.g. a large image) can last much longer than this,
-/// as long as bytes keep arriving without a gap longer than `CLIPBOARD_IDLE_TIMEOUT`.
+/// Maximum idle gap while reading a requested clipboard payload.
 const CLIPBOARD_IDLE_TIMEOUT: Duration = Duration::from_millis(3000);
 
-/// Short deadline used when opportunistically draining the daemon socket after
-/// `poll()` has already told us data is pending. Just keeps a buggy daemon from
-/// wedging the event loop if the socket signalled readable but returned nothing.
+/// Short deadline for other daemon messages after poll signals readability.
 const DAEMON_PEEK_TIMEOUT: Duration = Duration::from_millis(10);
 
 /// For each SPICE clipboard type we care about, the list of Wayland mime types
@@ -105,21 +99,29 @@ fn spice_type_for_mime(mime: &str) -> Option<u32> {
         .map(|f| f.spice_type)
 }
 
+#[derive(Default)]
+struct SelectionState {
+    source: Option<Source>,
+    offer: Option<Offer>,
+    mimes: Vec<String>,
+    owned: bool,
+    pending: Option<(u32, std::os::fd::OwnedFd, Instant)>,
+}
+
 struct AppState {
     seat: Option<WlSeat>,
     manager: Option<Manager>,
     device: Option<Device>,
     daemon: Arc<Mutex<UnixStream>>,
     conn: Option<Connection>,
-    current_source: Option<Source>,
-    current_offer: Option<Offer>,
-    // Mimes advertised by the current offer, accumulated from
-    // `data_control_offer.offer` events before `Selection` arrives.
-    current_offer_mimes: Vec<String>,
-    we_own_clipboard: bool,
+    // SPICE selection IDs: 0 = normal clipboard, 1 = PRIMARY.
+    selections: [SelectionState; 2],
+    // Offers are announced before their selection is known. Keep MIME lists
+    // attached to object IDs until Selection / PrimarySelection assigns them.
+    offers: Vec<(Offer, Vec<String>)>,
     // Globals discovered during first roundtrip; one is bound afterwards.
     ext_manager_name: Option<u32>,
-    wlr_manager_name: Option<u32>,
+    wlr_manager_name: Option<(u32, u32)>,
     // Tracked output geometry. `width`/`height` are the last values we've
     // already reported to the daemon; `pending_*` are staged from wl_output
     // Mode events and committed on `done`.
@@ -138,7 +140,10 @@ fn main() {
     }
     eprintln!("wayland-vdagent: starting");
 
-    let stream = UnixStream::connect(VDAGENTD_SOCKET).unwrap_or_else(|e| {
+    let stream = UnixStream::connect(
+        std::env::var("WAYLAND_VDAGENT_SOCKET").unwrap_or_else(|_| VDAGENTD_SOCKET.to_string()),
+    )
+    .unwrap_or_else(|e| {
         eprintln!("failed to connect to daemon: {}", e);
         std::process::exit(1);
     });
@@ -156,10 +161,8 @@ fn main() {
         device: None,
         daemon: daemon.clone(),
         conn: Some(conn.clone()),
-        current_source: None,
-        current_offer: None,
-        current_offer_mimes: Vec::new(),
-        we_own_clipboard: false,
+        selections: std::array::from_fn(|_| SelectionState::default()),
+        offers: Vec::new(),
         ext_manager_name: None,
         wlr_manager_name: None,
         width: 0,
@@ -172,16 +175,20 @@ fn main() {
     let registry = conn.display().get_registry(&qh, ());
     event_queue.roundtrip(&mut state).expect("roundtrip failed");
 
+    // A diagnostic override allows exercising wlr on compositors that expose both.
+    if std::env::var("WAYLAND_VDAGENT_DATA_CONTROL").as_deref() == Ok("wlr") {
+        state.ext_manager_name = None;
+    }
     // Now that all globals are known, bind exactly one data-control manager.
     state.manager = if let Some(name) = state.ext_manager_name {
         eprintln!("wayland-vdagent: using ext-data-control-v1");
         Some(Manager::Ext(
             registry.bind::<ExtDataControlManagerV1, _, _>(name, 1, &qh, ()),
         ))
-    } else if let Some(name) = state.wlr_manager_name {
+    } else if let Some((name, version)) = state.wlr_manager_name {
         eprintln!("wayland-vdagent: using wlr-data-control (legacy)");
         Some(Manager::Wlr(
-            registry.bind::<ZwlrDataControlManagerV1, _, _>(name, 2, &qh, ()),
+            registry.bind::<ZwlrDataControlManagerV1, _, _>(name, version.min(2), &qh, ()),
         ))
     } else {
         None
@@ -226,11 +233,30 @@ fn main() {
                 revents: 0,
             },
         ];
-        unsafe { poll(fds.as_mut_ptr(), 2, -1) };
+        let timeout = if state.selections.iter().any(|s| s.pending.is_some()) {
+            100
+        } else {
+            -1
+        };
+        unsafe { poll(fds.as_mut_ptr(), 2, timeout) };
+        for selection in &mut state.selections {
+            if selection
+                .pending
+                .as_ref()
+                .is_some_and(|(_, _, start)| start.elapsed() >= CLIPBOARD_IDLE_TIMEOUT)
+            {
+                selection.pending = None;
+            }
+        }
 
         if fds[0].revents & POLLIN != 0 {
             let mut d = daemon.lock().unwrap();
-            d.set_read_timeout(Some(DAEMON_PEEK_TIMEOUT)).ok();
+            let read_timeout = if state.selections.iter().any(|s| s.pending.is_some()) {
+                CLIPBOARD_IDLE_TIMEOUT
+            } else {
+                DAEMON_PEEK_TIMEOUT
+            };
+            d.set_read_timeout(Some(read_timeout)).ok();
             match read_msg(&mut d) {
                 Ok(msg) => {
                     drop(d);
@@ -284,8 +310,13 @@ fn handle_daemon_msg(state: &mut AppState, qh: &QueueHandle<AppState>, msg: &Uds
             send_resolution(&state.daemon, state.width, state.height);
         }
         VDAGENTD_CLIPBOARD_GRAB => {
-            // Only handle CLIPBOARD selection (not PRIMARY).
-            if msg.arg1 != 0 {
+            let sel = msg.arg1 as usize;
+            if sel >= 2
+                || !state
+                    .device
+                    .as_ref()
+                    .is_some_and(|d| d.supports_selection(sel))
+            {
                 return;
             }
             // Collect the SPICE types advertised by the host and map each to
@@ -312,7 +343,8 @@ fn handle_daemon_msg(state: &mut AppState, qh: &QueueHandle<AppState>, msg: &Uds
 
             // Fresh source per grab — the previous one may already be cancelled.
             if let Some(manager) = &state.manager {
-                if let Some(old) = state.current_source.take() {
+                state.selections[sel].pending = None;
+                if let Some(old) = state.selections[sel].source.take() {
                     old.destroy();
                 }
                 let source = manager.create_data_source(qh);
@@ -320,22 +352,31 @@ fn handle_daemon_msg(state: &mut AppState, qh: &QueueHandle<AppState>, msg: &Uds
                     source.offer((*mime).to_string());
                 }
                 if let Some(device) = &state.device {
-                    device.set_selection(Some(&source));
+                    device.set_selection(sel, Some(&source));
                 }
-                state.current_source = Some(source);
-                state.we_own_clipboard = true;
+                state.selections[sel].source = Some(source);
+                state.selections[sel].owned = true;
             }
         }
         VDAGENTD_CLIPBOARD_DATA => {
-            // CLIPBOARD_DATA that arrives through the main loop is stray — the
-            // real response to our REQUEST is drained synchronously inside
-            // `handle_source_send`. Drop it.
+            if let Some(selection) = state.selections.get_mut(msg.arg1 as usize) {
+                if let Some((wanted, fd, _)) = selection.pending.take() {
+                    if wanted == msg.arg2 {
+                        let mut file = std::fs::File::from(fd);
+                        let _ = file.write_all(&msg.data);
+                    }
+                }
+            }
         }
         VDAGENTD_CLIPBOARD_REQUEST => {
+            let sel = msg.arg1 as usize;
+            if sel >= 2 {
+                return;
+            }
             let wanted_type = msg.arg2;
             eprintln!("wayland-vdagent: host requests our clipboard (type={wanted_type})");
-            let data = state.current_offer.as_ref().and_then(|offer| {
-                canonical_mime_for(wanted_type, &state.current_offer_mimes)
+            let data = state.selections[sel].offer.as_ref().and_then(|offer| {
+                canonical_mime_for(wanted_type, &state.selections[sel].mimes)
                     .and_then(|mime| read_offer(offer, &mime, state.conn.as_ref()))
             });
             let d = state.daemon.lock().unwrap();
@@ -360,18 +401,31 @@ fn handle_daemon_msg(state: &mut AppState, qh: &QueueHandle<AppState>, msg: &Uds
             }
         }
         VDAGENTD_CLIPBOARD_RELEASE => {
-            if msg.arg1 == 0 {
-                state.we_own_clipboard = false;
-                if let Some(source) = state.current_source.take() {
+            if let Some(selection) = state.selections.get_mut(msg.arg1 as usize) {
+                if selection.owned {
+                    if let Some(device) = &state.device {
+                        device.set_selection(msg.arg1 as usize, None);
+                    }
+                }
+                selection.owned = false;
+                selection.pending = None;
+                if let Some(source) = selection.source.take() {
                     source.destroy();
                 }
             }
         }
         VDAGENTD_CLIENT_DISCONNECTED => {
-            eprintln!("wayland-vdagent: client disconnected");
-            state.we_own_clipboard = false;
-            if let Some(source) = state.current_source.take() {
-                source.destroy();
+            for (sel, selection) in state.selections.iter_mut().enumerate() {
+                if selection.owned {
+                    if let Some(device) = &state.device {
+                        device.set_selection(sel, None);
+                    }
+                }
+                selection.owned = false;
+                selection.pending = None;
+                if let Some(source) = selection.source.take() {
+                    source.destroy();
+                }
             }
         }
         VDAGENTD_MONITORS_CONFIG => {
@@ -419,7 +473,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
         qh: &QueueHandle<Self>,
     ) {
         if let wl_registry::Event::Global {
-            name, interface, ..
+            name,
+            interface,
+            version,
         } = event
         {
             match interface.as_str() {
@@ -433,7 +489,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
                     let _ = registry.bind::<WlOutput, _, _>(name, 2, qh, ());
                 }
                 EXT_MANAGER_INTERFACE => state.ext_manager_name = Some(name),
-                WLR_MANAGER_INTERFACE => state.wlr_manager_name = Some(name),
+                WLR_MANAGER_INTERFACE => state.wlr_manager_name = Some((name, version)),
                 _ => {}
             }
         }
@@ -447,14 +503,14 @@ delegate_noop!(AppState: ignore ExtDataControlManagerV1);
 impl Dispatch<ZwlrDataControlOfferV1, ()> for AppState {
     fn event(
         state: &mut Self,
-        _: &ZwlrDataControlOfferV1,
+        offer: &ZwlrDataControlOfferV1,
         event: zwlr_data_control_offer_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         if let zwlr_data_control_offer_v1::Event::Offer { mime_type } = event {
-            handle_offer_mime(state, mime_type);
+            handle_offer_mime(state, offer.id(), mime_type);
         }
     }
 }
@@ -462,14 +518,14 @@ impl Dispatch<ZwlrDataControlOfferV1, ()> for AppState {
 impl Dispatch<ExtDataControlOfferV1, ()> for AppState {
     fn event(
         state: &mut Self,
-        _: &ExtDataControlOfferV1,
+        offer: &ExtDataControlOfferV1,
         event: ext_data_control_offer_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         if let ext_data_control_offer_v1::Event::Offer { mime_type } = event {
-            handle_offer_mime(state, mime_type);
+            handle_offer_mime(state, offer.id(), mime_type);
         }
     }
 }
@@ -521,36 +577,46 @@ impl Dispatch<WlOutput, ()> for AppState {
 }
 
 fn handle_data_offer(state: &mut AppState, offer: Offer) {
-    if let Some(old) = state.current_offer.take() {
+    state.offers.push((offer, Vec::new()));
+}
+
+fn handle_offer_mime(state: &mut AppState, id: wayland_client::backend::ObjectId, mime: String) {
+    if let Some((_, mimes)) = state.offers.iter_mut().find(|(o, _)| o.id() == id) {
+        mimes.push(mime);
+    }
+}
+
+fn handle_selection(
+    state: &mut AppState,
+    sel: usize,
+    id: Option<wayland_client::backend::ObjectId>,
+) {
+    let incoming = id
+        .and_then(|id| state.offers.iter().position(|(o, _)| o.id() == id))
+        .map(|i| state.offers.remove(i));
+    let selection = &mut state.selections[sel];
+    if let Some(old) = selection.offer.take() {
         old.destroy();
     }
-    state.current_offer = Some(offer);
-    state.current_offer_mimes.clear();
-}
-
-fn handle_offer_mime(state: &mut AppState, mime_type: String) {
-    state.current_offer_mimes.push(mime_type);
-}
-
-fn handle_selection(state: &mut AppState, has_offer: bool) {
-    if !has_offer || state.we_own_clipboard {
+    selection.mimes.clear();
+    if selection.owned {
+        if let Some((offer, _)) = incoming {
+            offer.destroy();
+        }
         return;
     }
-    let types = spice_types_for_mimes(&state.current_offer_mimes);
-    if types.is_empty() {
-        eprintln!(
-            "wayland-vdagent: guest clipboard changed but no supported mime ({:?})",
-            state.current_offer_mimes
-        );
-        return;
+    if let Some((offer, mimes)) = incoming {
+        selection.offer = Some(offer);
+        selection.mimes = mimes;
     }
-    eprintln!("wayland-vdagent: guest clipboard changed, sending GRAB for types {types:?}");
-    let mut payload = Vec::with_capacity(types.len() * 4);
-    for t in &types {
-        payload.extend_from_slice(&t.to_le_bytes());
-    }
+    let types = spice_types_for_mimes(&selection.mimes);
     let d = state.daemon.lock().unwrap();
-    send_msg(&d, VDAGENTD_CLIPBOARD_GRAB, 0, 0, &payload);
+    if types.is_empty() {
+        send_msg(&d, VDAGENTD_CLIPBOARD_RELEASE, sel as u32, 0, &[]);
+    } else {
+        let payload: Vec<u8> = types.iter().flat_map(|t| t.to_le_bytes()).collect();
+        send_msg(&d, VDAGENTD_CLIPBOARD_GRAB, sel as u32, 0, &payload);
+    }
 }
 
 /// Drain `offer` into a `Vec` via a pipe for a given mime type.
@@ -575,49 +641,44 @@ fn read_offer(offer: &Offer, mime: &str, conn: Option<&Connection>) -> Option<Ve
     Some(data)
 }
 
-fn handle_source_send(state: &mut AppState, mime_type: String, fd: std::os::fd::OwnedFd) {
-    let Some(spice_type) = spice_type_for_mime(&mime_type) else {
-        eprintln!("wayland-vdagent: paste request for unsupported mime {mime_type}");
+// Defer REQUEST until paste, and keep each selection's reply independent.
+// Reading DATA in the main loop also preserves interleaved daemon messages.
+fn handle_source_send(
+    state: &mut AppState,
+    id: wayland_client::backend::ObjectId,
+    mime_type: String,
+    fd: std::os::fd::OwnedFd,
+) {
+    let Some(sel) = state
+        .selections
+        .iter()
+        .position(|s| s.source.as_ref().is_some_and(|s| s.id() == id))
+    else {
         return;
     };
-    eprintln!("wayland-vdagent: paste request for {mime_type} (type={spice_type})");
-
-    let mut d = state.daemon.lock().unwrap();
-    send_msg(&d, VDAGENTD_CLIPBOARD_REQUEST, 0, spice_type, &[]);
-
-    // Per-read idle timeout — each successful read resets it, so a large
-    // image that arrives in many chunks is fine as long as chunks keep coming.
-    d.set_read_timeout(Some(CLIPBOARD_IDLE_TIMEOUT)).ok();
-    let mut data = Vec::new();
-    loop {
-        match read_msg(&mut d) {
-            Ok(msg) if msg.msg_type == VDAGENTD_CLIPBOARD_DATA && msg.arg1 == 0 => {
-                data = msg.data;
-                break;
-            }
-            Ok(_) => continue,
-            Err(_) => break,
-        }
+    let Some(spice_type) = spice_type_for_mime(&mime_type) else {
+        return;
+    };
+    if state.selections[sel].pending.is_some() {
+        return;
     }
-    d.set_read_timeout(Some(DAEMON_PEEK_TIMEOUT)).ok();
-    drop(d);
-
-    if !data.is_empty() {
-        eprintln!(
-            "wayland-vdagent: serving {} bytes ({mime_type})",
-            data.len()
-        );
-        let raw_fd = IntoRawFd::into_raw_fd(fd);
-        let mut file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
-        let _ = file.write_all(&data);
-    } else {
-        eprintln!("wayland-vdagent: no data from SPICE for {mime_type}");
-    }
+    state.selections[sel].pending = Some((spice_type, fd, Instant::now()));
+    let d = state.daemon.lock().unwrap();
+    send_msg(&d, VDAGENTD_CLIPBOARD_REQUEST, sel as u32, spice_type, &[]);
 }
 
-fn handle_source_cancelled(state: &mut AppState) {
-    eprintln!("wayland-vdagent: clipboard source cancelled");
-    state.we_own_clipboard = false;
+fn handle_source_cancelled(state: &mut AppState, id: wayland_client::backend::ObjectId) {
+    if let Some(selection) = state
+        .selections
+        .iter_mut()
+        .find(|s| s.source.as_ref().is_some_and(|s| s.id() == id))
+    {
+        selection.owned = false;
+        selection.pending = None;
+        if let Some(source) = selection.source.take() {
+            source.destroy();
+        }
+    }
 }
 
 impl Dispatch<ZwlrDataControlDeviceV1, ()> for AppState {
@@ -637,7 +698,10 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for AppState {
                 handle_data_offer(state, Offer::Wlr(id))
             }
             zwlr_data_control_device_v1::Event::Selection { id } => {
-                handle_selection(state, id.is_some())
+                handle_selection(state, 0, id.map(|o| o.id()))
+            }
+            zwlr_data_control_device_v1::Event::PrimarySelection { id } => {
+                handle_selection(state, 1, id.map(|o| o.id()))
             }
             _ => {}
         }
@@ -647,7 +711,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for AppState {
 impl Dispatch<ZwlrDataControlSourceV1, ()> for AppState {
     fn event(
         state: &mut Self,
-        _: &ZwlrDataControlSourceV1,
+        source: &ZwlrDataControlSourceV1,
         event: zwlr_data_control_source_v1::Event,
         _: &(),
         _: &Connection,
@@ -655,9 +719,11 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for AppState {
     ) {
         match event {
             zwlr_data_control_source_v1::Event::Send { mime_type, fd } => {
-                handle_source_send(state, mime_type, fd)
+                handle_source_send(state, source.id(), mime_type, fd)
             }
-            zwlr_data_control_source_v1::Event::Cancelled => handle_source_cancelled(state),
+            zwlr_data_control_source_v1::Event::Cancelled => {
+                handle_source_cancelled(state, source.id())
+            }
             _ => {}
         }
     }
@@ -680,7 +746,10 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for AppState {
                 handle_data_offer(state, Offer::Ext(id))
             }
             ext_data_control_device_v1::Event::Selection { id } => {
-                handle_selection(state, id.is_some())
+                handle_selection(state, 0, id.map(|o| o.id()))
+            }
+            ext_data_control_device_v1::Event::PrimarySelection { id } => {
+                handle_selection(state, 1, id.map(|o| o.id()))
             }
             _ => {}
         }
@@ -690,7 +759,7 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for AppState {
 impl Dispatch<ExtDataControlSourceV1, ()> for AppState {
     fn event(
         state: &mut Self,
-        _: &ExtDataControlSourceV1,
+        source: &ExtDataControlSourceV1,
         event: ext_data_control_source_v1::Event,
         _: &(),
         _: &Connection,
@@ -698,9 +767,11 @@ impl Dispatch<ExtDataControlSourceV1, ()> for AppState {
     ) {
         match event {
             ext_data_control_source_v1::Event::Send { mime_type, fd } => {
-                handle_source_send(state, mime_type, fd)
+                handle_source_send(state, source.id(), mime_type, fd)
             }
-            ext_data_control_source_v1::Event::Cancelled => handle_source_cancelled(state),
+            ext_data_control_source_v1::Event::Cancelled => {
+                handle_source_cancelled(state, source.id())
+            }
             _ => {}
         }
     }

@@ -3,7 +3,7 @@
 
 use std::os::fd::BorrowedFd;
 use wayland_client::protocol::wl_seat::WlSeat;
-use wayland_client::{Dispatch, QueueHandle};
+use wayland_client::{Dispatch, Proxy, QueueHandle};
 
 pub use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
@@ -66,7 +66,29 @@ impl Manager {
 }
 
 impl Device {
-    pub fn set_selection(&self, source: Option<&Source>) {
+    pub fn supports_selection(&self, sel: usize) -> bool {
+        sel == 0
+            || (sel == 1
+                && match self {
+                    Device::Ext(_) => true,
+                    Device::Wlr(d) => d.version() >= 2,
+                })
+    }
+
+    pub fn set_selection(&self, sel: usize, source: Option<&Source>) {
+        if !self.supports_selection(sel) {
+            return;
+        }
+        if sel == 1 {
+            match (self, source) {
+                (Device::Ext(d), Some(Source::Ext(s))) => d.set_primary_selection(Some(s)),
+                (Device::Ext(d), None) => d.set_primary_selection(None),
+                (Device::Wlr(d), Some(Source::Wlr(s))) => d.set_primary_selection(Some(s)),
+                (Device::Wlr(d), None) => d.set_primary_selection(None),
+                _ => {}
+            }
+            return;
+        }
         match (self, source) {
             (Device::Ext(d), Some(Source::Ext(s))) => d.set_selection(Some(s)),
             (Device::Ext(d), None) => d.set_selection(None),
@@ -79,6 +101,13 @@ impl Device {
 }
 
 impl Source {
+    pub fn id(&self) -> wayland_client::backend::ObjectId {
+        match self {
+            Self::Ext(o) => o.id(),
+            Self::Wlr(o) => o.id(),
+        }
+    }
+
     pub fn offer(&self, mime_type: String) {
         match self {
             Source::Ext(s) => s.offer(mime_type),
@@ -95,6 +124,13 @@ impl Source {
 }
 
 impl Offer {
+    pub fn id(&self) -> wayland_client::backend::ObjectId {
+        match self {
+            Self::Ext(o) => o.id(),
+            Self::Wlr(o) => o.id(),
+        }
+    }
+
     pub fn receive(&self, mime_type: String, fd: BorrowedFd<'_>) {
         match self {
             Offer::Ext(o) => o.receive(mime_type, fd),
